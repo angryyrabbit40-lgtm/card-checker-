@@ -4,24 +4,61 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 import asyncio
-import authorizenet
-from authorizenet.apicontractsv1 import (
-    MerchantAuthenticationType,
-    TransactionRequestType,
-    TransactionTypeEnum,
-    PaymentType,
-    CreditCardType,
-)
+import requests
+import json
+from base64 import b64encode
+import hashlib
+import time
 
-AUTHORIZE_LOGIN_ID = os.getenv("AUTHORIZE_LOGIN_ID")
-AUTHORIZE_TRANSACTION_KEY = os.getenv("AUTHORIZE_TRANSACTION_KEY")
+RAPYD_ACCESS_KEY = os.getenv("RAPYD_ACCESS_KEY")
+RAPYD_SECRET_KEY = os.getenv("RAPYD_SECRET_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Use sandbox environment for testing
-authorizenet.constants.SANDBOX = True
+# Rapyd sandbox URL
+RAPYD_API_URL = "https://sandboxapi.rapyd.net"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+class RapydClient:
+    def __init__(self, access_key, secret_key):
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.base_url = RAPYD_API_URL
+
+    def _generate_signature(self, method, path, body, timestamp):
+        """Generate Rapyd API signature"""
+        body_str = json.dumps(body) if body else ""
+        to_sign = f"{method}\n{path}\n{self.access_key}\n{timestamp}\n{body_str}"
+        signature = b64encode(
+            hashlib.sha256(
+                f"{to_sign}{self.secret_key}".encode()
+            ).digest()
+        ).decode()
+        return signature
+
+    def request(self, method, path, body=None):
+        """Make authenticated request to Rapyd API"""
+        timestamp = str(int(time.time()))
+        signature = self._generate_signature(method, path, body, timestamp)
+        
+        headers = {
+            "Content-Type": "application/json",
+            "access_key": self.access_key,
+            "timestamp": timestamp,
+            "signature": signature,
+        }
+        
+        url = f"{self.base_url}{path}"
+        
+        if method == "POST":
+            response = requests.post(url, json=body, headers=headers)
+        elif method == "GET":
+            response = requests.get(url, headers=headers)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        
+        return response.json()
 
 class CardChecker:
     DECLINE_CODES = {
@@ -145,82 +182,87 @@ class CardChecker:
 
     @staticmethod
     async def check_card(card_data: dict, amount: int = 100) -> dict:
+        """Check card with Rapyd - tests balance and card validity"""
         try:
-            # Create merchant authentication
-            merchant_auth = MerchantAuthenticationType()
-            merchant_auth.name = AUTHORIZE_LOGIN_ID
-            merchant_auth.transactionKey = AUTHORIZE_TRANSACTION_KEY
-
-            # Create credit card object
-            credit_card = CreditCardType()
-            credit_card.cardNumber = card_data["number"]
-            credit_card.expirationDate = f"{card_data['exp_year']}-{card_data['exp_month'].zfill(2)}"
-            credit_card.cardCode = card_data["cvc"]
-
-            # Create payment object
-            payment = PaymentType()
-            payment.creditCard = credit_card
-
-            # Create transaction request
-            transaction_request = TransactionRequestType()
-            transaction_request.transactionType = TransactionTypeEnum.authOnlyTransaction
-            transaction_request.amount = amount / 100  # Convert cents to dollars
-            transaction_request.payment = payment
-
-            # Execute request in thread pool
-            def make_request():
-                from authorizenet.controller import CreateTransactionController
-                
-                create_transaction_request = authorizenet.apicontractsv1.CreateTransactionRequest()
-                create_transaction_request.merchantAuthentication = merchant_auth
-                create_transaction_request.refId = "ref123"
-                create_transaction_request.transactionRequest = transaction_request
-
-                controller = CreateTransactionController(create_transaction_request)
-                controller.execute()
-                return controller.getresponse()
-
-            response = await asyncio.to_thread(make_request)
-
-            if response is None:
+            client = RapydClient(RAPYD_ACCESS_KEY, RAPYD_SECRET_KEY)
+            
+            # Create payment method (card)
+            payment_method_body = {
+                "type": "us_visa_card",
+                "fields": {
+                    "number": card_data["number"],
+                    "expiration_month": int(card_data["exp_month"]),
+                    "expiration_year": int(card_data["exp_year"]),
+                    "cvv": card_data["cvc"],
+                }
+            }
+            
+            def create_payment_method():
+                return client.request("POST", "/v1/payment_methods", payment_method_body)
+            
+            pm_response = await asyncio.to_thread(create_payment_method)
+            
+            if pm_response.get("status", {}).get("status") != "SUCCESS":
+                error_msg = pm_response.get("status", {}).get("message", "Failed to create payment method")
                 return {
                     "status": "ERROR",
                     "code": "96",
-                    "message": "No response from Authorize.net"
+                    "message": error_msg
                 }
-
-            # Check response code
-            if response.messages.resultCode == "Ok":
-                # Transaction approved
+            
+            payment_method_id = pm_response.get("data", {}).get("id")
+            
+            # Create charge (pre-auth with $1)
+            charge_body = {
+                "amount": amount,
+                "currency": "USD",
+                "payment_method": payment_method_id,
+                "capture": False,  # Pre-auth only
+                "description": "Card balance check"
+            }
+            
+            def create_charge():
+                return client.request("POST", "/v1/charges", charge_body)
+            
+            charge_response = await asyncio.to_thread(create_charge)
+            
+            if charge_response.get("status", {}).get("status") == "SUCCESS":
                 return {
                     "status": "LIVE",
                     "code": "00",
-                    "message": "Card approved"
+                    "message": "Card approved - has balance"
                 }
             else:
-                # Transaction declined or error
-                message = ""
-                if response.messages.message:
-                    message = response.messages.message[0]['text'].text if response.messages.message else "Unknown error"
+                # Declined or error
+                status_obj = charge_response.get("status", {})
+                error_code = status_obj.get("error_code", "96")
+                error_msg = status_obj.get("message", "Card declined")
                 
-                # Check if it's a decline or error
-                if response.transactionResponse and response.transactionResponse.responseCode == "2":
-                    # Card declined
-                    status = "DEAD"
-                    code = "05"
-                elif response.transactionResponse and response.transactionResponse.responseCode == "3":
-                    # Error
-                    status = "ERROR"
-                    code = "96"
+                # Map Rapyd error codes to ISO 8583
+                if "insufficient" in error_msg.lower() or error_code == "INSUFFICIENT_FUNDS":
+                    return {
+                        "status": "INSUFF",
+                        "code": "51",
+                        "message": "Insufficient funds"
+                    }
+                elif "expired" in error_msg.lower():
+                    return {
+                        "status": "DEAD",
+                        "code": "54",
+                        "message": "Card expired"
+                    }
+                elif "cvv" in error_msg.lower() or "cvc" in error_msg.lower():
+                    return {
+                        "status": "DEAD",
+                        "code": "55",
+                        "message": "Invalid CVC"
+                    }
                 else:
-                    status = "DEAD"
-                    code = "05"
-
-                return {
-                    "status": status,
-                    "code": code,
-                    "message": message
-                }
+                    return {
+                        "status": "DEAD",
+                        "code": "05",
+                        "message": error_msg
+                    }
 
         except Exception as e:
             logger.error(f"Error checking card: {str(e)}")
