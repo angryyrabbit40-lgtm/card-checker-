@@ -46,21 +46,53 @@ class CardChecker:
     @staticmethod
     def parse_card(card_string: str) -> dict:
         card_string = card_string.strip()
-        if '|' not in card_string:
+
+        # Detect primary separator: pipe, comma, or whitespace (in priority order)
+        if '|' in card_string:
+            parts = [p.strip() for p in card_string.split('|')]
+        elif ',' in card_string:
+            parts = [p.strip() for p in card_string.split(',')]
+        else:
+            parts = card_string.split()
+
+        # Remove any empty parts produced by splitting
+        parts = [p for p in parts if p]
+
+        if len(parts) == 3:
+            # Expiry is combined as month/year in the second field: number|month/year|cvc
+            card_num = parts[0].replace(' ', '').replace('-', '')
+            expiry = parts[1]
+            cvc = parts[2]
+
+            if '/' in expiry:
+                exp_month, exp_year = expiry.split('/', 1)
+                exp_month = exp_month.strip()
+                exp_year = exp_year.strip()
+            else:
+                return None
+
+        elif len(parts) >= 4:
+            # Expiry is split across two separate fields: number|month|year|cvc
+            card_num = parts[0].replace(' ', '').replace('-', '')
+            exp_month = parts[1]
+            exp_year = parts[2]
+            cvc = parts[3]
+
+            # Handle month/year combined in the month field (e.g. space-separated with slash)
+            if '/' in exp_month:
+                exp_month, exp_year = exp_month.split('/', 1)
+                exp_month = exp_month.strip()
+                exp_year = exp_year.strip()
+                # cvc was already set to parts[2]; shift it to parts[3] is not needed
+                # because in this branch parts[1] held month/year, so cvc is parts[2]
+                cvc = parts[2]
+
+        else:
             return None
-        
-        parts = card_string.split('|')
-        if len(parts) < 4:
-            return None
-        
-        card_num = parts[0].replace(' ', '').replace('-', '')
-        exp_month = parts[1].strip()
-        exp_year = parts[2].strip()
-        cvc = parts[3].strip()
-        
+
         if len(exp_year) == 2:
             exp_year = '20' + exp_year
-        
+
         return {
             "number": card_num,
             "exp_month": exp_month,
