@@ -162,8 +162,8 @@ class CardChecker:
             }
         
         except stripe.error.CardError as e:
-            decline_code = e.decline_code or "05"
-            code = CardChecker.DECLINE_CODES.get(decline_code, "05")
+            decline_code = getattr(e, 'decline_code', None) or "96"
+            code = CardChecker.DECLINE_CODES.get(decline_code, "96")
             
             if decline_code == 'insufficient_funds':
                 status = "INSUFF"
@@ -173,7 +173,7 @@ class CardChecker:
             return {
                 "status": status,
                 "code": code,
-                "message": str(e.user_message)
+                "message": str(getattr(e, 'user_message', None) or str(e))
             }
         
         except Exception as e:
