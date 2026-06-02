@@ -137,7 +137,8 @@ class CardChecker:
     @staticmethod
     async def check_card(card_data: dict, amount: int = 100) -> dict:
         try:
-            token = stripe.Token.create(
+            token = await asyncio.to_thread(
+                stripe.Token.create,
                 card={
                     "number": card_data["number"],
                     "exp_month": card_data["exp_month"],
@@ -146,7 +147,8 @@ class CardChecker:
                 }
             )
             
-            charge = stripe.Charge.create(
+            charge = await asyncio.to_thread(
+                stripe.Charge.create,
                 amount=amount,
                 currency="usd",
                 source=token.id,
