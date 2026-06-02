@@ -230,7 +230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['bulk_mode'] = None
 
-async def main():
+def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
     app.add_handler(CommandHandler("check", check_command))
@@ -239,7 +239,7 @@ async def main():
     app.add_handler(CommandHandler("mass_auth", mass_auth_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
