@@ -1,13 +1,24 @@
-import stripe
 import logging
 import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 import asyncio
+import authorizenet
+from authorizenet.apicontractsv1 import (
+    MerchantAuthenticationType,
+    TransactionRequestType,
+    TransactionTypeEnum,
+    PaymentType,
+    CreditCardType,
+)
 
-stripe.api_key = os.getenv("STRIPE_API_KEY")
+AUTHORIZE_LOGIN_ID = os.getenv("AUTHORIZE_LOGIN_ID")
+AUTHORIZE_TRANSACTION_KEY = os.getenv("AUTHORIZE_TRANSACTION_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# Use sandbox environment for testing
+authorizenet.constants.SANDBOX = True
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -83,8 +94,6 @@ class CardChecker:
                 exp_month, exp_year = exp_month.split('/', 1)
                 exp_month = exp_month.strip()
                 exp_year = exp_year.strip()
-                # cvc was already set to parts[2]; shift it to parts[3] is not needed
-                # because in this branch parts[1] held month/year, so cvc is parts[2]
                 cvc = parts[2]
 
         else:
@@ -137,46 +146,84 @@ class CardChecker:
     @staticmethod
     async def check_card(card_data: dict, amount: int = 100) -> dict:
         try:
-            token = await asyncio.to_thread(
-                stripe.Token.create,
-                card={
-                    "number": card_data["number"],
-                    "exp_month": card_data["exp_month"],
-                    "exp_year": card_data["exp_year"],
-                    "cvc": card_data["cvc"],
+            # Create merchant authentication
+            merchant_auth = MerchantAuthenticationType()
+            merchant_auth.name = AUTHORIZE_LOGIN_ID
+            merchant_auth.transactionKey = AUTHORIZE_TRANSACTION_KEY
+
+            # Create credit card object
+            credit_card = CreditCardType()
+            credit_card.cardNumber = card_data["number"]
+            credit_card.expirationDate = f"{card_data['exp_year']}-{card_data['exp_month'].zfill(2)}"
+            credit_card.cardCode = card_data["cvc"]
+
+            # Create payment object
+            payment = PaymentType()
+            payment.creditCard = credit_card
+
+            # Create transaction request
+            transaction_request = TransactionRequestType()
+            transaction_request.transactionType = TransactionTypeEnum.authOnlyTransaction
+            transaction_request.amount = amount / 100  # Convert cents to dollars
+            transaction_request.payment = payment
+
+            # Execute request in thread pool
+            def make_request():
+                from authorizenet.controller import CreateTransactionController
+                
+                create_transaction_request = authorizenet.apicontractsv1.CreateTransactionRequest()
+                create_transaction_request.merchantAuthentication = merchant_auth
+                create_transaction_request.refId = "ref123"
+                create_transaction_request.transactionRequest = transaction_request
+
+                controller = CreateTransactionController(create_transaction_request)
+                controller.execute()
+                return controller.getresponse()
+
+            response = await asyncio.to_thread(make_request)
+
+            if response is None:
+                return {
+                    "status": "ERROR",
+                    "code": "96",
+                    "message": "No response from Authorize.net"
                 }
-            )
-            
-            charge = await asyncio.to_thread(
-                stripe.Charge.create,
-                amount=amount,
-                currency="usd",
-                source=token.id,
-                capture=False
-            )
-            
-            return {
-                "status": "LIVE",
-                "code": "00",
-                "message": "Card approved"
-            }
-        
-        except stripe.error.CardError as e:
-            decline_code = e.decline_code or "05"
-            code = CardChecker.DECLINE_CODES.get(decline_code, "05")
-            
-            if decline_code == 'insufficient_funds':
-                status = "INSUFF"
+
+            # Check response code
+            if response.messages.resultCode == "Ok":
+                # Transaction approved
+                return {
+                    "status": "LIVE",
+                    "code": "00",
+                    "message": "Card approved"
+                }
             else:
-                status = "DEAD"
-            
-            return {
-                "status": status,
-                "code": code,
-                "message": str(e.user_message)
-            }
-        
+                # Transaction declined or error
+                message = ""
+                if response.messages.message:
+                    message = response.messages.message[0]['text'].text if response.messages.message else "Unknown error"
+                
+                # Check if it's a decline or error
+                if response.transactionResponse and response.transactionResponse.responseCode == "2":
+                    # Card declined
+                    status = "DEAD"
+                    code = "05"
+                elif response.transactionResponse and response.transactionResponse.responseCode == "3":
+                    # Error
+                    status = "ERROR"
+                    code = "96"
+                else:
+                    status = "DEAD"
+                    code = "05"
+
+                return {
+                    "status": status,
+                    "code": code,
+                    "message": message
+                }
+
         except Exception as e:
+            logger.error(f"Error checking card: {str(e)}")
             return {
                 "status": "ERROR",
                 "code": "96",
@@ -277,3 +324,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
