@@ -91,6 +91,14 @@ class CardChecker:
         '6': 'DISCOVER',
     }
 
+    # Rapyd card type mapping by BIN
+    CARD_TYPE_MAP = {
+        '4': 'us_visa_card',           # Visa
+        '5': 'us_mastercard_card',     # Mastercard
+        '3': 'us_amex_card',           # Amex
+        '6': 'us_discover_card',       # Discover
+    }
+
     @staticmethod
     def parse_card(card_string: str) -> dict:
         card_string = card_string.strip()
@@ -181,14 +189,28 @@ class CardChecker:
         return CardChecker.BANK_NAMES.get(first_digit, 'UNKNOWN')
 
     @staticmethod
+    def get_card_type(card_num: str) -> str:
+        """Detect card type from BIN (first digit)"""
+        first_digit = card_num[0]
+        return CardChecker.CARD_TYPE_MAP.get(first_digit, 'us_visa_card')
+
+    @staticmethod
     async def check_card(card_data: dict, amount: int = 100) -> dict:
-        """Check card with Rapyd - tests balance and card validity"""
+        """Check card with Rapyd - tests balance and card validity
+        
+        Args:
+            card_data: Card details (number, exp_month, exp_year, cvc)
+            amount: Pre-auth amount in cents (default: 100 = $1.00)
+        """
         try:
             client = RapydClient(RAPYD_ACCESS_KEY, RAPYD_SECRET_KEY)
             
-            # Create payment method (card)
+            # Detect card type from BIN
+            card_type = CardChecker.get_card_type(card_data["number"])
+            
+            # Create payment method (card) - supports any country
             payment_method_body = {
-                "type": "us_visa_card",
+                "type": card_type,
                 "fields": {
                     "number": card_data["number"],
                     "expiration_month": int(card_data["exp_month"]),
@@ -212,12 +234,12 @@ class CardChecker:
             
             payment_method_id = pm_response.get("data", {}).get("id")
             
-            # Create charge (pre-auth with $1)
+            # Create pre-auth charge ($1.00 = 100 cents)
             charge_body = {
                 "amount": amount,
                 "currency": "USD",
                 "payment_method": payment_method_id,
-                "capture": False,  # Pre-auth only
+                "capture": False,  # Pre-auth only - no actual charge
                 "description": "Card balance check"
             }
             
@@ -287,6 +309,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🔄 Checking card...")
     
+    # Pre-auth for $1.00 (100 cents)
     result = await CardChecker.check_card(card_data, amount=100)
     bank = CardChecker.get_bank(card_data["number"])
     cc = card_data["number"]
@@ -313,6 +336,7 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🔄 0-authing card...")
     
+    # Pre-auth for $0.00 (0 cents) - just validates card
     result = await CardChecker.check_card(card_data, amount=0)
     bank = CardChecker.get_bank(card_data["number"])
     cc = card_data["number"]
